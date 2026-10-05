@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.2.0] - 2026-10-05
+
+### Added
+
+- Manual answer selection for context: `/context answers`, `exclude N...`,
+  `include N...` and `keep-last`. User requests and the full transcript are
+  retained; selection persists in sessions and archives without altering spent
+  token totals. Answer headings display numbers and an exclusion marker.
+
+### Fixed
+
+- Tab completion and unique-prefix execution for `/context` subcommands,
+  including `ans`/`answ` for `answers`. Ambiguous prefixes preserve the input
+  and display candidates without performing an action.
+
 ## [1.1.0] - 2026-10-05
 
 ### Added

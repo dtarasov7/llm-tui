@@ -2,18 +2,18 @@
 
 English | [Русский](README-ru.md)
 
-Version **1.1.0** appears at the top of the TUI on startup. To check it without
+Version **1.2.0** appears at the top of the TUI on startup. To check it without
 starting the interface: `python3.8 llm-tui.py --version`.
 Changelog: [English](CHANGELOG.md), [Russian](CHANGELOG-ru.md).
 
-Changes in 1.1.0:
+Changes in 1.2.0:
 
-- Input/output token totals in the status line and details through `/tokens`.
-- Prompt text through `/system show [ROLE]`; select one primary role and add
-  requirements from other areas in the task itself.
-- Executed TUI commands in persistent Ctrl+P/Ctrl+N input history.
-- Alt+Enter or Ctrl+G to send; Enter inserts a newline. In PuTTY, disable
-  **Window → Behaviour → Full screen on Alt-Enter**.
+- Manual answer selection for context through `/context answers`, `exclude`,
+  `include` and `keep-last`, retaining user requests and the full transcript.
+- Answer numbers and exclusion markers in the transcript; selection persists
+  with sessions and archives.
+- Tab completion and unique-prefix execution for `/context` subcommands:
+  `/context ans` + Tab completes `answers`; `/context answ` executes it.
 
 A terminal client for engineering work with local llama.cpp and vLLM servers.
 One executable file, Python 3.8+, standard library only; on Linux, Python must
@@ -283,6 +283,10 @@ Main commands:
 /files                    sources, sizes, line counts, changes on disk
 /unload code              remove a source
 /context                  detailed count of the current context
+/context answers          list answer numbers and context membership
+/context exclude 1 2      exclude answers #1 and #2 while retaining user requests
+/context include 1        restore answer #1 to context
+/context keep-last        keep only the latest nonempty answer in context
 /status                   current status
 /tokens                   input/output token usage for the last request and session
 /paths                    effective storage paths
@@ -302,6 +306,42 @@ Main commands:
 `/save` and `/code N` without a path create a file in exports. Existing files are
 never overwritten: choose another name. `/retry` keeps the previous attempt in
 the transcript, marks it as superseded, and excludes it from subsequent API context.
+
+## Manually excluding answers from context
+
+When each answer contains the complete current code, you can manually exclude
+older versions from subsequent requests. User messages remain in the model's
+history, while excluded answers stay in the transcript for copying, export and
+restoration.
+
+```text
+/context answers
+/context exclude 1 2
+/context include 1
+/context keep-last
+```
+
+`/context answers` lists each answer's number, state, timestamp and preview.
+The same `#N` numbers appear in answer headings; commands and notifications do
+not change the numbering. Excluded answers display `[вне контекста]`.
+`exclude` and `include` accept one or more answer numbers.
+
+`/context` subcommands also accept unique prefixes: `/context answ` executes
+`answers`, and Tab completes `/context ans` to `/context answers`.
+The same applies to `exc`, `inc`, `keep`, `ma`, `res` and `au`.
+`/context a` is ambiguous between `answers` and `auto`: no action is taken,
+the input stays intact, and candidates appear in the upper panel.
+
+`keep-last` excludes older answers and includes the latest nonempty answer that
+was not superseded by `/retry`. Use it when that answer contains all required
+code; an answer containing only a patch or function may still need an earlier
+answer. Answers superseded by `/retry` cannot be restored with `include`.
+
+Selection persists with sessions and archives and is reflected in context counts.
+Previously spent tokens in `/tokens` remain counted. Wait for network work to
+finish or stop it before changing selection; listing is available during
+generation. Use `/context` afterward to recount active context. Normal automatic
+trimming of older turns still applies when the context budget is exceeded.
 
 ## Token usage
 

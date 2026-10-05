@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional
 
 # ---------------- User configuration / пользовательские настройки ----------------
 APP_NAME = "llm-tui"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 DEFAULT_BACKEND = "llama-local"
 DEFAULT_RESPONSE_TOKEN_RESERVE = 8192
 HTTP_TIMEOUT = 60
@@ -122,6 +122,7 @@ TERMINAL_KEYS = {
 }
 
 RUSSIAN_KEYS = dict(zip("йцукенгшщзфывапролджэячсмить", "qwertyuiopasdfghjkl;'zxcvbnm"))
+CONTEXT_SUBCOMMANDS = {name: name for name in ("max", "auto", "reserve", "answers", "exclude", "include", "keep-last")}
 
 
 def shortcut_letter(key):
@@ -1125,7 +1126,7 @@ class ContextManager:
             if message.role == "user":
                 turns.append([{"role": "user", "content": message.content}])
             elif message.role == "assistant" and turns:
-                if message.content:
+                if message.content and not message.metadata.get("context_excluded"):
                     turns[-1].append({"role": "assistant", "content": message.content})
         return turns
 
@@ -1360,14 +1361,18 @@ class TranscriptView:
     def render(self, messages, width, reasoning_view="full", elapsed=0.0, tick=None):
         rows, ranges, parts, row_offsets, content_starts = [], [], [], [], []
         document_size = 0
+        answer_number = 0
         tick = int(time.monotonic() * 5) if tick is None else tick
         for index, message in enumerate(messages):
+            if message.role == "assistant":
+                answer_number += 1
             reasoning = message.metadata.get("reasoning", "")
             reasoning = reasoning if isinstance(reasoning, str) else ""
             generating = bool(message.metadata.get("generating"))
             thinking = generating and not message.content
             key = (width, message.content, reasoning, reasoning_view,
                    message.metadata.get("stopped_by_user", False), generating,
+                   answer_number, message.metadata.get("context_excluded", False),
                    tick if thinking else None, int(elapsed) if thinking else None)
             cached = self.cache.get(index)
             if cached is None or cached[0] != key:
@@ -1388,6 +1393,10 @@ class TranscriptView:
                 time_label = message.timestamp[11:16] if isinstance(message.timestamp, str) else ""
                 heading = "{} {}{}".format(message.role.upper(), time_label,
                                            " [stopped]" if message.metadata.get("stopped_by_user") else "")
+                if message.role == "assistant":
+                    heading += " #{}".format(answer_number)
+                    if message.metadata.get("context_excluded"):
+                        heading += " [вне контекста]"
                 add_line(heading, "heading")
                 if thinking:
                     spinner = "⠋⠙⠹⠸"[tick % 4]
@@ -1646,7 +1655,7 @@ class App:
             ("reload", "АЛИАС", "Перечитать источник; при ошибке сохранить прежнюю копию"),
             ("files", "", "Показать источники и отметки изменений на диске"),
             ("unload", "АЛИАС", "Удалить источник из сессии"),
-            ("context", "[max N|auto|reserve N]", "Посчитать запрос из редактора и показать активный контекст"),
+            ("context", "[max N|auto|reserve N|answers|exclude N...|include N...|keep-last]", "Посчитать контекст или вручную исключить/вернуть ответы модели"),
             ("status", "", "Показать состояние сервера и контекста"),
             ("tokens", "", "Показать расход входных и выходных токенов за запрос и сессию"),
             ("paths", "", "Показать пути данных, архивов, экспорта, журнала и блокировки"),
@@ -2006,6 +2015,12 @@ class App:
 
     def cmd_context(self, args):
         if args:
+            subcommand = resolve_command(args[0], CONTEXT_SUBCOMMANDS)
+            args = [subcommand] + args[1:]
+        if args and args[0] in ("answers", "exclude", "include", "keep-last"):
+            self.context_answers(args)
+            return
+        if args:
             if args == ["auto"]:
                 self.session.context_override = None
                 self.maximum = positive_int(BACKENDS[self.session.backend].get("context_size"))
@@ -2022,7 +2037,7 @@ class App:
                 self.invalidate_context()
                 self.notify("Context {} set to {}".format(args[0], value))
             else:
-                raise AppError("Usage: /context [max N|auto|reserve N]")
+                raise AppError("Usage: " + self.registry["context"].usage)
             return
         if self.worker:
             self.show_context()
@@ -2031,6 +2046,54 @@ class App:
         if request.lstrip().startswith("/"):
             request = ""
         self.start_job("context", request)
+
+    def context_answers(self, args):
+        """Change only assistant context membership; retain transcript and usage."""
+        action = args[0]
+        answers = [message for message in self.session.messages if message.role == "assistant"]
+        if action == "answers":
+            self.arguments(args, 1, 1)
+            rows = ["№ | Контекст | Время | Начало ответа"]
+            for number, message in enumerate(answers, 1):
+                state = "включён"
+                if message.metadata.get("superseded"):
+                    state = "заменён /retry"
+                elif message.metadata.get("context_excluded"):
+                    state = "исключён"
+                preview_text = message.content.replace("\n", " ")
+                visible_preview = visible_text(preview_text)
+                preview = clip_text(visible_preview, 70)
+                rows.append("{} | {} | {} | {}".format(number, state, message.timestamp, preview))
+            if not answers:
+                rows.append("Ответов модели пока нет.")
+            rows.append("/context exclude N... | /context include N... | /context keep-last")
+            self.notify("\n".join(rows))
+            return
+        if self.worker:
+            raise AppError("A network job is running. Use Esc or /stop, then retry.")
+        if action == "keep-last":
+            self.arguments(args, 1, 1)
+            latest = next((message for message in reversed(answers)
+                           if message.content and not message.metadata.get("superseded")), None)
+            if latest is None:
+                raise AppError("No answer to keep in context.")
+            for message in answers:
+                message.metadata["context_excluded"] = message is not latest
+            self.notify("В контексте оставлен только последний ответ. Запросы пользователя сохранены.")
+        else:
+            if len(args) < 2:
+                raise AppError("Specify answer numbers; see /context answers.")
+            numbers = [positive_int(value) for value in args[1:]]
+            if any(number is None or number > len(answers) for number in numbers):
+                raise AppError("Invalid answer number; see /context answers.")
+            selected = [answers[number - 1] for number in numbers]
+            if action == "include" and any(message.metadata.get("superseded") for message in selected):
+                raise AppError("An answer superseded by /retry cannot be restored to context.")
+            for message in selected:
+                message.metadata["context_excluded"] = action == "exclude"
+            state = "Исключены из контекста" if action == "exclude" else "Возвращены в контекст"
+            self.notify("{} ответы: {}. Запросы пользователя сохранены.".format(state, ", ".join(args[1:])))
+        self.invalidate_context()
 
     def show_context(self):
         context = self.context
@@ -2294,7 +2357,7 @@ class App:
         if arguments is None:
             completed = leading + command.name
         else:
-            choices = {"system": list(SYSTEM_PROMPTS), "backend": list(BACKENDS),
+            choices = {"system": list(SYSTEM_PROMPTS), "context": list(CONTEXT_SUBCOMMANDS), "backend": list(BACKENDS),
                        "model": [item["id"] for item in self.models], "reload": list(self.session.sources),
                        "unload": list(self.session.sources)}.get(command.name, [])
             argument_prefix = arguments.lstrip()
@@ -2865,6 +2928,151 @@ class SelfTests(unittest.TestCase):
             prepared = ContextManager(backend, maximum, 20).build(session, "request")
             self.assertEqual(prepared["maximum"], maximum)
             self.assertEqual(prepared["trimmed"], 0)
+
+    def test_manual_answer_exclusion_preserves_requests_transcript_and_usage(self):
+        session = Session(messages=[
+            Message("user", "Write Python 3.8 code"),
+            Message("assistant", "old complete program", metadata={"usage": {"prompt_tokens": 100, "completion_tokens": 20}}),
+            Message("notification", "notification"),
+            Message("user", "Add a function; keep compatibility"),
+            Message("assistant", "latest complete program", metadata={"usage": {"prompt_tokens": 200, "completion_tokens": 40}}),
+        ])
+        app = App(SessionStore(self.root), session, self.root / "test.log")
+        previous_usage = app.token_totals()
+        backend = mock.Mock(count_tokens=estimate_tokens)
+        manager = ContextManager(backend, 32768, 20)
+        before = manager.build(session, "Fix a bug")
+        app.context = before
+        app.editor.set_text("/context exclude 1")
+        app.submit()
+        after = manager.build(session, "Fix a bug")
+        self.assertEqual([item["content"] for item in after["messages"][1:]],
+                         ["Write Python 3.8 code", "Add a function; keep compatibility",
+                          "latest complete program", "Fix a bug"])
+        self.assertLess(after["tokens"], before["tokens"])
+        self.assertIsNone(app.context)
+        self.assertEqual(session.messages[1].content, "old complete program")
+        self.assertEqual(app.token_totals(), previous_usage)
+        app.render_transcript()
+        self.assertIn("#1 [вне контекста]", app.transcript.document)
+        self.assertIn("old complete program", app.transcript.document)
+        restored = app.store.load()
+        self.assertTrue(restored.messages[1].metadata["context_excluded"])
+        restored_history = ContextManager.history_turns(restored.messages)
+        self.assertEqual(restored_history, ContextManager.history_turns(session.messages))
+        archive_id = app.store.archive(session)
+        self.assertTrue(app.store.open_archive(archive_id).messages[1].metadata["context_excluded"])
+        app.editor.set_text("/context include 1")
+        app.submit()
+        included = manager.build(session, "Fix a bug")
+        self.assertEqual(included["messages"], before["messages"])
+        app.render_transcript()
+        self.assertNotIn("[вне контекста]", app.transcript.document)
+        self.assertFalse(app.store.load().messages[1].metadata["context_excluded"])
+        self.assertEqual(app.token_totals(), previous_usage)
+
+    def test_keep_last_answer_and_stable_numbers(self):
+        session = Session(messages=[Message("user", "request one"), Message("assistant", "v1"),
+                                    Message("user", "request two"), Message("assistant", "v2"),
+                                    Message("assistant", "old retry", metadata={"superseded": True}),
+                                    Message("assistant", "", metadata={"error": "failed"})])
+        app = App(SessionStore(self.root), session, self.root / "test.log")
+        app.cmd_context(["keep-last"])
+        history = ContextManager.history_turns(session.messages)
+        self.assertEqual(history, [[{"role": "user", "content": "request one"}],
+                                   [{"role": "user", "content": "request two"}, {"role": "assistant", "content": "v2"}]])
+        app.cmd_context(["answers"])
+        self.assertIn("1 | исключён", session.messages[-1].content)
+        self.assertIn("2 | включён", session.messages[-1].content)
+        self.assertIn("3 | заменён /retry", session.messages[-1].content)
+        app.notify("Extra notification must not change answer numbers")
+        app.cmd_context(["include", "1", "2"])
+        self.assertFalse(session.messages[1].metadata["context_excluded"])
+        app.cmd_context(["exclude", "1", "2"])
+        self.assertTrue(session.messages[1].metadata["context_excluded"])
+        self.assertTrue(session.messages[3].metadata["context_excluded"])
+        app.cmd_context(["keep-last"])
+        self.assertFalse(session.messages[3].metadata["context_excluded"])
+        self.assertEqual(ContextManager.history_turns(session.messages), history)
+
+    def test_context_answer_validation_is_atomic_and_busy_listing_is_allowed(self):
+        session = Session(messages=[Message("user", "request"), Message("assistant", "answer"),
+                                    Message("assistant", "old retry", metadata={"superseded": True})])
+        app = App(SessionStore(self.root), session, self.root / "test.log")
+        for args in (["exclude"], ["exclude", "0"], ["exclude", "-1"], ["exclude", "1.5"],
+                     ["exclude", "1", "99"], ["include", "1", "2"], ["answers", "1"], ["keep-last", "1"]):
+            with self.subTest(args=args), self.assertRaises(AppError):
+                app.cmd_context(args)
+            self.assertNotIn("context_excluded", session.messages[1].metadata)
+        app.worker = mock.Mock()
+        app.cmd_context(["answers"])
+        self.assertIn("1 | включён", session.messages[-1].content)
+        with self.assertRaises(AppError):
+            app.cmd_context(["exclude", "1"])
+        app.worker.cancel.assert_not_called()
+        self.assertNotIn("context_excluded", session.messages[1].metadata)
+        empty = App(SessionStore(self.root), Session(), self.root / "test.log")
+        empty.cmd_context(["answers"])
+        self.assertIn("Ответов модели пока нет", empty.session.messages[-1].content)
+        with self.assertRaises(AppError):
+            empty.cmd_context(["keep-last"])
+
+    def test_context_subcommands_completion_and_short_execution(self):
+        app = App(SessionStore(self.root), Session(messages=[Message("user", "requirements"),
+                  Message("assistant", "old code"), Message("assistant", "latest code")]), self.root / "test.log")
+        screen = mock.Mock()
+        for text, expected in (("/context ans", "/context answers"), ("/con answ", "/context answers"),
+                               ("/context au", "/context auto"), ("/context exc", "/context exclude"),
+                               ("/context inc", "/context include"), ("/context keep", "/context keep-last"),
+                               ("/context ma", "/context max"), ("/context res", "/context reserve")):
+            app.editor.set_text(text)
+            app.process_key("\t", screen)
+            self.assertEqual(app.editor.text, expected)
+        app.editor.set_text("/context exc 1")
+        app.editor.cursor = len("/context exc")
+        app.process_key("\t", screen)
+        self.assertEqual(app.editor.text, "/context exclude 1")
+        app.editor.set_text("/context answ")
+        app.process_key("\x07", screen)
+        self.assertIn("1 | включён", app.session.messages[-1].content)
+        self.assertEqual(app.editor.text, "")
+        self.assertEqual(app.session.input_history[-1], "/context answ")
+        app.editor.set_text("/con exc 1")
+        app.process_key("\x07", screen)
+        self.assertTrue(app.session.messages[1].metadata["context_excluded"])
+        app.editor.set_text("/context inc 1")
+        app.process_key("\x07", screen)
+        self.assertFalse(app.session.messages[1].metadata["context_excluded"])
+        app.editor.set_text("/context keep")
+        app.process_key("\x07", screen)
+        self.assertTrue(app.session.messages[1].metadata["context_excluded"])
+        self.assertFalse(app.session.messages[2].metadata["context_excluded"])
+
+    def test_context_subcommand_ambiguity_and_parameter_prefixes(self):
+        app = App(SessionStore(self.root), Session(), self.root / "test.log")
+        screen = mock.Mock()
+        app.editor.set_text("/context a")
+        app.process_key("\t", screen)
+        self.assertEqual(app.editor.text, "/context a")
+        self.assertIn("auto", app.session.messages[-1].content)
+        self.assertIn("answers", app.session.messages[-1].content)
+        app.process_key("\x07", screen)
+        self.assertEqual(app.editor.text, "/context a")
+        self.assertIn("Ambiguous", app.session.messages[-1].content)
+        self.assertIsNone(app.worker)
+        self.assertEqual(app.session.input_history, [])
+        app.editor.set_text("/context unknown")
+        app.process_key("\x07", screen)
+        self.assertEqual(app.editor.text, "/context unknown")
+        self.assertIsNone(app.worker)
+        app.cmd_context(["ma", "32768"])
+        self.assertEqual(app.session.context_override, 32768)
+        app.cmd_context(["res", "1024"])
+        self.assertEqual(app.session.response_token_reserve, 1024)
+        with mock.patch.object(app, "start_job") as start_job:
+            app.cmd_context(["au"])
+            start_job.assert_called_once_with("probe")
+        self.assertIsNone(app.session.context_override)
 
     def test_sse_partial_unicode_usage_and_errors(self):
         raw = ('data: {"choices":[{"delta":{"content":"Привет"}}]}\r\n\r\n'
