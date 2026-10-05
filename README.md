@@ -2,9 +2,18 @@
 
 English | [Русский](README-ru.md)
 
-Version **1.0.0** appears at the top of the TUI on startup. To check it without
+Version **1.1.0** appears at the top of the TUI on startup. To check it without
 starting the interface: `python3.8 llm-tui.py --version`.
 Changelog: [English](CHANGELOG.md), [Russian](CHANGELOG-ru.md).
+
+Changes in 1.1.0:
+
+- Input/output token totals in the status line and details through `/tokens`.
+- Prompt text through `/system show [ROLE]`; select one primary role and add
+  requirements from other areas in the task itself.
+- Executed TUI commands in persistent Ctrl+P/Ctrl+N input history.
+- Alt+Enter or Ctrl+G to send; Enter inserts a newline. In PuTTY, disable
+  **Window → Behaviour → Full screen on Alt-Enter**.
 
 A terminal client for engineering work with local llama.cpp and vLLM servers.
 One executable file, Python 3.8+, standard library only; on Linux, Python must
@@ -88,9 +97,9 @@ request with `/retry` or reconnect with `/backend NAME`.
 |---|---|
 | Ctrl+G | Send a request or execute a command |
 | Enter | Insert a newline |
-| Ctrl+Enter | Send if the terminal supports CSI-u/modifyOtherKeys |
+| Alt+Enter | Send a request or execute a command; disable PuTTY's Alt+Enter fullscreen shortcut |
 | Arrow keys, Home/End, Backspace/Delete | Edit multiline input |
-| Ctrl+P / Ctrl+N | Browse input history; restore the draft after the last entry |
+| Ctrl+P / Ctrl+N | Browse requests and executed TUI commands; restore the draft after the last entry |
 | Tab | Complete a command, role, backend, model, or alias |
 | PgUp / PgDn | Scroll the transcript, including during streaming |
 | Ctrl+W | Switch focus between the editor and answer viewer |
@@ -133,6 +142,21 @@ with information screens open.
 Bracketed paste supports multiline text. Enter does not send a message.
 After manual scrolling, streaming does not return the viewer to the bottom;
 Ctrl+B resumes following new tokens.
+
+Alt+Enter executes the command in the editor or sends a request, just like Ctrl+G.
+The TUI enables key disambiguation in terminals supporting kitty/CSI-u and restores
+the previous mode on exit. modifyOtherKeys sequences and Escape followed by Enter
+are also recognized. Plain Enter in the editor retains its newline behavior.
+
+In PuTTY, disable **Window → Behaviour → Full screen on Alt-Enter** so the key
+combination reaches the application. During a connection, access these settings
+via the window menu → **Change Settings**. Save the setting in your PuTTY session.
+See the [official documentation](https://the.earth.li/~sgtatham/putty/0.85/htmldoc/Chapter4.html#config-altenter).
+
+Commands typed in the editor and successfully executed, including abbreviations
+such as `/sys ansible`, are saved in history alongside requests. Ctrl+P recalls
+the previous entry; Ctrl+N recalls the next entry and then the draft. History is
+saved with the session. Shortcuts for help and other panels do not add entries.
 
 Function keys are recognized through curses/terminfo and common SS3/CSI/Linux
 sequences. After a command result or a new notification, the upper panel scrolls
@@ -252,13 +276,15 @@ Main commands:
 /archive [name]           save a snapshot without clearing
 /sessions                 list archives
 /open ID                  restore an archive; a unique ID prefix is accepted
-/system [role]            show or select a system role
+/system [ROLE]            list roles or select one role
+/system show [ROLE]       display the active or specified prompt text
 /load "path with spaces" code
 /reload code              reread a file; keep the old copy on failure
 /files                    sources, sizes, line counts, changes on disk
 /unload code              remove a source
 /context                  detailed count of the current context
 /status                   current status
+/tokens                   input/output token usage for the last request and session
 /paths                    effective storage paths
 /select                   view and select the last answer
 /copy [FIRST LAST]        copy an answer, selection, or line range
@@ -276,6 +302,22 @@ Main commands:
 `/save` and `/code N` without a path create a file in exports. Existing files are
 never overwritten: choose another name. `/retry` keeps the previous attempt in
 the transcript, marks it as superseded, and excludes it from subsequent API context.
+
+## Token usage
+
+`IN` and `OUT` in the top status line show cumulative input and output token usage
+for the current session. `/tokens` also shows the last request's counts and the
+number of answers with missing statistics. Counts come from the server's `usage`
+fields, `prompt_tokens` and `completion_tokens`. Input includes the entire context
+sent with each request, rather than only the user's new text.
+
+Totals include previous `/retry` attempts and stopped or failed answers when the
+server reported usage. Repeated usage updates replace an attempt's counts instead
+of adding them again. `?` means unknown usage; `250+?` means 250 known tokens plus
+answers with missing statistics. A stopped stream may never deliver final usage;
+text length estimates do not replace server counts. Counts persist with the
+conversation and return on restart or archive restore. `/new` and `/clear` start
+the counters at zero.
 
 ## Sources and context
 
@@ -395,6 +437,28 @@ System prompts are defined in `SYSTEM_PROMPTS`: general, architect, security,
 python, bash, linux, ansible, devops, sre, network, database, code-review,
 troubleshooter, log-analyzer, and performance. Switching roles preserves the
 conversation.
+
+Select one primary role and include additional requirements in the task text:
+
+```text
+/system ansible
+Review this Ansible role, including security: access permissions and secret storage.
+```
+
+Multiple role prompts are not combined. The role persists in sessions and archives
+and is included in context counts. Older sessions with combined roles restore
+the first role while preserving the conversation; the change is logged.
+
+View prompt text without changing the selected roles:
+
+```text
+/system show                 full active prompt
+/system show security        one role's prompt
+```
+
+Viewing a prompt is available during generation and does not stop it. Text is
+shown in the upper panel; use PgUp/PgDn to scroll. Tab completes the role,
+including after `show`.
 
 ## Data, logs, and verification
 

@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional
 
 # ---------------- User configuration / пользовательские настройки ----------------
 APP_NAME = "llm-tui"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 DEFAULT_BACKEND = "llama-local"
 DEFAULT_RESPONSE_TOKEN_RESERVE = 8192
 HTTP_TIMEOUT = 60
@@ -118,7 +118,7 @@ TERMINAL_KEYS = {
     "\x1b[1;2A": curses.KEY_SR, "\x1b[1;2B": curses.KEY_SF,
     "\x1b[1;2C": curses.KEY_SRIGHT, "\x1b[1;2D": curses.KEY_SLEFT,
     "\x1b[1;2H": curses.KEY_SHOME, "\x1b[1;2F": curses.KEY_SEND,
-    "\x1b[13;5u": "\x07", "\x1b[27;5;13~": "\x07", "\x1b[13;5~": "\x07",
+    "\x1b\r": "\x07", "\x1b\n": "\x07", "\x1b[13;3~": "\x07",
 }
 
 RUSSIAN_KEYS = dict(zip("йцукенгшщзфывапролджэячсмить", "qwertyuiopasdfghjkl;'zxcvbnm"))
@@ -131,24 +131,40 @@ def shortcut_letter(key):
 
 
 def decode_modified_key(sequence):
-    """Decode Ctrl letters and lock modifiers in CSI-u/modifyOtherKeys packets."""
-    unicode_key = re.fullmatch(r"\x1b\[(\d+(?::\d*){0,2});(\d+)(?::([123]))?(?:;[\d:]+)?u", sequence)
+    """Decode Ctrl letters, Alt+Enter and lock modifiers in extended packets."""
+    unicode_key = re.fullmatch(r"\x1b\[(\d+(?::\d*){0,2})(?:;(\d+)(?::([123]))?)?(?:;[\d:]+)?u", sequence)
     other_key = re.fullmatch(r"\x1b\[27;(\d+);(\d+)~", sequence)
     if unicode_key or other_key:
         if unicode_key:
             key_codes = unicode_key.group(1).split(":")
             # A supplied base-layout code identifies the physical key in any layout.
             code = int(key_codes[2] if len(key_codes) == 3 and key_codes[2] else key_codes[0])
-            modifiers = int(unicode_key.group(2)) - 1
+            modifiers = int(unicode_key.group(2) or "1") - 1
             if unicode_key.group(3) == "3":
                 return None  # Releasing a key must not execute its action again.
         else:
             code = int(other_key.group(2))
             modifiers = int(other_key.group(1)) - 1
-        if not modifiers & 4 or modifiers & ~(1 | 4 | 64 | 128):
+        if code == 57414:  # Keypad Enter in kitty disambiguation mode.
+            code = 13
+        if code == 13 and modifiers & 2 and not modifiers & ~(1 | 2 | 64 | 128):
+            return "\x07"  # Alt+Enter sends, just like Ctrl+G.
+        if modifiers & ~(1 | 4 | 64 | 128):
             return None
         if code == 13:
-            return "\x07"  # Ctrl+Enter sends, just like Ctrl+G.
+            return "\r"
+        keypad_navigation = {57417: "1;{}D", 57418: "1;{}C", 57419: "1;{}A", 57420: "1;{}B",
+                             57421: "5;{}~", 57422: "6;{}~", 57423: "1;{}H", 57424: "1;{}F",
+                             57426: "3;{}~"}
+        if code in keypad_navigation:
+            navigation_sequence = "\x1b[" + keypad_navigation[code].format(modifiers + 1)
+            return decode_modified_key(navigation_sequence)
+        if not modifiers & 4:
+            # CSI-u disambiguation also encodes Escape and locked special keys.
+            plain_keys = {27: "\x1b", 127: "\x7f"}
+            if code == 9 and not modifiers & 1:
+                return "\t"
+            return plain_keys.get(code)
         if 0 <= code <= 0x10FFFF:
             letter = shortcut_letter(chr(code))
             if len(letter) == 1 and "a" <= letter <= "z":
@@ -309,6 +325,24 @@ class Message:
     metadata: dict = field(default_factory=dict)
 
 
+def reported_token_usage(message):
+    """Return server-reported input/output counts; missing data stays unknown."""
+    usage = message.metadata.get("usage", {})
+    if not isinstance(usage, dict):
+        usage = {}
+    counts = []
+    for key in ("prompt_tokens", "completion_tokens"):
+        value = usage.get(key)
+        counts.append(value if type(value) is int and value >= 0 else None)
+    return tuple(counts)
+
+
+def format_token_total(total, missing):
+    if missing:
+        return "{}+?".format(total) if total else "?"
+    return str(total)
+
+
 @dataclass
 class Source:
     alias: str
@@ -438,6 +472,10 @@ class Session:
             raise AppError("Invalid context override.")
         if result.context_override is not None:
             result.context_override = int(result.context_override)
+        previous_roles = result.system_prompt.split("+")
+        if len(previous_roles) > 1 and all(role in SYSTEM_PROMPTS for role in previous_roles):
+            LOG.warning("Combined system role %s restored as %s", result.system_prompt, previous_roles[0])
+            result.system_prompt = previous_roles[0]
         if result.system_prompt not in SYSTEM_PROMPTS or result.thinking not in ("auto", "on", "off"):
             raise AppError("Invalid system role or thinking mode.")
         result.sampling = data.get("sampling", {})
@@ -1601,7 +1639,7 @@ class App:
             ("archive", "[имя]", "Сохранить текущую сессию в архив"),
             ("sessions", "", "Показать архивные сессии"),
             ("open", "ID", "Восстановить архив по ID или однозначному префиксу"),
-            ("system", "[роль]", "Показать или изменить системную роль"),
+            ("system", "[РОЛЬ|show [РОЛЬ]]", "Выбрать системную роль; show показывает текст промпта"),
             ("backend", "[имя]", "Показать или сменить сервер; текущее имя повторяет подключение"),
             ("model", "[имя]", "Обновить список моделей или выбрать модель"),
             ("load", "ПУТЬ [алиас]", "Загрузить источник UTF-8 без отправки модели"),
@@ -1610,6 +1648,7 @@ class App:
             ("unload", "АЛИАС", "Удалить источник из сессии"),
             ("context", "[max N|auto|reserve N]", "Посчитать запрос из редактора и показать активный контекст"),
             ("status", "", "Показать состояние сервера и контекста"),
+            ("tokens", "", "Показать расход входных и выходных токенов за запрос и сессию"),
             ("paths", "", "Показать пути данных, архивов, экспорта, журнала и блокировки"),
             ("select", "", "Перейти к последнему ответу для выделения между страницами"),
             ("copy", "[ПЕРВАЯ ПОСЛЕДНЯЯ]", "Отправить в буфер ответ, выделение или диапазон строк; нужна поддержка терминала"),
@@ -1753,7 +1792,7 @@ class App:
                 key = "usage" if kind == "USAGE" else "timings"
                 self.usage.update(event[key])
                 if self.answer is not None:
-                    self.answer.metadata[key] = event[key]
+                    self.answer.metadata.setdefault(key, {}).update(event[key])
             elif kind == "FINISH" and self.answer is not None:
                 self.answer.metadata["finish_reason"] = event["reason"]
             elif kind == "ERROR":
@@ -1782,6 +1821,8 @@ class App:
             if parsed is not None:
                 command, arguments = parsed
                 command.handler(arguments)
+                self.session.input_history.append(text)
+                self.editor.history_position = None
                 if self.editor.text == text:
                     self.editor.set_text("")
                 self.persist()
@@ -1801,7 +1842,7 @@ class App:
         self.arguments(args)
         lines = ["{}  [{}]  {}".format(command.usage, "/" + shortest_prefix(name, self.registry), command.description)
                  for name, command in sorted(self.registry.items())]
-        lines.extend(["", "Ctrl+G Отправить | Enter Новая строка | Ctrl+P/N История ввода | Tab Дополнение",
+        lines.extend(["", "Ctrl+G/Alt+Enter Отправить | Enter Новая строка | Ctrl+P/N История запросов и команд | Tab Дополнение",
                       "PgUp/PgDn Прокрутка | Ctrl+W Просмотр/Ввод | Ctrl+T/B Начало/Конец диалога",
                       "В просмотре: стрелки/Home/End/PgUp/PgDn перемещают курсор; v отмечает начало выделения; y копирует; f сохраняет в файл; Enter возвращает к вводу.",
                       "f или /saveclip сохраняет выделение, а без него весь последний ответ: <data-dir>/exports/save-<дата-время>.clb.",
@@ -1817,7 +1858,7 @@ class App:
                       "summary показывает Thinking, анимацию, число символов и время. Текущий режим указан у поля ввода.",
                       "/paths Каталоги хранения: ./llm-tui/data и ./llm-tui/logs по умолчанию",
                       "Esc Остановить | Ctrl+L Перерисовать | Ctrl+Q Выйти | Ctrl+C Остановить или выйти",
-                      "Поддерживается вставка bracketed paste. Ctrl+Enter работает в терминалах с CSI-u/modifyOtherKeys.",
+                      "Поддерживается вставка bracketed paste. Alt+Enter отправляет; в PuTTY отключите Window → Behaviour → Full screen on Alt-Enter.",
                       "@alias или @alias#L10-L30 прикрепляет снимок источника только к этому запросу.",
                       "Источники не прикрепляются повторно при отправке истории диалога.",
                       "Сгенерированный код сохраняется, отображается и экспортируется; выполнения кода нет."])
@@ -1875,17 +1916,24 @@ class App:
         self.start_job("probe")
 
     def cmd_system(self, args):
-        self.arguments(args, 0, 1)
+        self.arguments(args, 0, 2 if args and args[0] == "show" else 1)
         if not args:
-            self.notify("Roles: " + ", ".join(sorted(SYSTEM_PROMPTS)) + "\nCurrent: " + self.session.system_prompt)
+            self.notify("Roles: " + ", ".join(sorted(SYSTEM_PROMPTS)) + "\nCurrent: " + self.session.system_prompt
+                        + "\n/system РОЛЬ — выбрать роль\n/system show [РОЛЬ] — показать текст промпта")
             return
-        if args[0] not in SYSTEM_PROMPTS:
-            raise AppError("Unknown role: " + args[0])
+        showing = args[0] == "show"
+        role_args = args[1:] if showing else args
+        role = role_args[0] if role_args else self.session.system_prompt
+        if role not in SYSTEM_PROMPTS:
+            raise AppError("Unknown role: " + role)
+        if showing:
+            self.notify("SYSTEM PROMPT: {}\n\n{}".format(role, SYSTEM_PROMPTS[role]))
+            return
         self.retire()
         old = self.session.system_prompt
-        self.session.system_prompt = args[0]
+        self.session.system_prompt = role
         self.invalidate_context()
-        self.notify("SYSTEM ROLE CHANGED: {} -> {}".format(old, args[0]))
+        self.notify("SYSTEM ROLE CHANGED: {} -> {}".format(old, role))
 
     def cmd_backend(self, args):
         self.arguments(args, 0, 1)
@@ -1999,6 +2047,37 @@ class App:
     def cmd_status(self, args):
         self.arguments(args)
         self.notify(self.status_line())
+
+    def token_totals(self):
+        """Include every attempt, even superseded, stopped or failed answers."""
+        totals = [0, 0]
+        missing = [0, 0]
+        for message in self.session.messages:
+            if message.role != "assistant":
+                continue
+            for index, count in enumerate(reported_token_usage(message)):
+                if count is None:
+                    missing[index] += 1
+                else:
+                    totals[index] += count
+        return totals, missing
+
+    def cmd_tokens(self, args):
+        self.arguments(args)
+        totals, missing = self.token_totals()
+        lines = ["Токены сессии: IN {} | OUT {}".format(
+            format_token_total(totals[0], missing[0]), format_token_total(totals[1], missing[1]))]
+        for message in reversed(self.session.messages):
+            if message.role == "assistant":
+                incoming, outgoing = reported_token_usage(message)
+                lines.append("Последний запрос: IN {} | OUT {}".format(
+                    incoming if incoming is not None else "?", outgoing if outgoing is not None else "?"))
+                break
+        lines.append("Ответов без статистики: IN {} | OUT {}".format(*missing))
+        lines.append("IN включает весь отправленный контекст каждого запроса.\n"
+                     "? — сервер не сообщил расход; +? — сумма неполная.\n"
+                     "Повторные и остановленные попытки учитываются при наличии usage.")
+        self.notify("\n".join(lines))
 
     def cmd_paths(self, args):
         self.arguments(args)
@@ -2219,13 +2298,20 @@ class App:
                        "model": [item["id"] for item in self.models], "reload": list(self.session.sources),
                        "unload": list(self.session.sources)}.get(command.name, [])
             argument_prefix = arguments.lstrip()
+            argument_head = ""
+            if command.name == "system":
+                if argument_prefix.startswith("show "):
+                    argument_head = "show "
+                    argument_prefix = argument_prefix[5:].lstrip()
+                else:
+                    choices = choices + ["show"]
             matches = [choice for choice in choices if choice.startswith(argument_prefix)]
             if argument_prefix in choices:
                 matches = [argument_prefix]
             if len(matches) != 1:
                 self.notify("Completions: " + (", ".join(matches) or "none"))
                 return
-            completed = leading + command.name + " " + shlex.quote(matches[0])
+            completed = leading + command.name + " " + argument_head + shlex.quote(matches[0])
         suffix = self.editor.text[self.editor.cursor:]
         self.editor.set_text(completed + suffix)
         self.editor.cursor = len(completed)
@@ -2280,8 +2366,10 @@ class App:
             progress += " | generated {}".format(generated)
         if isinstance(rate, (int, float)) and math.isfinite(rate):
             progress += " | {:.1f} tok/s".format(rate)
-        result = "{} | {} | {} | role:{} | CTX {}{}/{} reserve:{} | {} THINK:{}{}{}".format(
-            self.status, self.session.backend, self.session.model or "server-default", self.session.system_prompt,
+        totals, missing = self.token_totals()
+        result = "{} | IN:{} OUT:{} | {} | {} | role:{} | CTX {}{}/{} reserve:{} | {} THINK:{}{}{}".format(
+            self.status, format_token_total(totals[0], missing[0]), format_token_total(totals[1], missing[1]),
+            self.session.backend, self.session.model or "server-default", self.session.system_prompt,
             marker, tokens, self.maximum or "?", reserve, "CUSTOM" if self.session.sampling else "SERVER",
             self.session.thinking, active, progress)
         self.status_cache = (cache_key, result)
@@ -2339,7 +2427,7 @@ class App:
                     self.draw_text(screen, offset + 2, column, marked, attribute | curses.A_REVERSE)
         separator = 2 + transcript_height
         reasoning_label = "счётчик" if self.session.reasoning_view == "summary" else "текст"
-        label = " Ввод [Ctrl+G отправить | Ctrl+W просмотр] [F6 мысли: {}] ".format(reasoning_label)
+        label = " Ввод [Ctrl+G/Alt+Enter отправить | Ctrl+W просмотр] [F6 мысли: {}] ".format(reasoning_label)
         label += "[прокрутка]" if not self.transcript.follow else ""
         self.draw_text(screen, separator, 0, label + "─" * max(0, width - len(label) - 1))
         rows, positions = self.editor.layout(width - 3)
@@ -2364,7 +2452,7 @@ class App:
         if self.ui_notice and time.monotonic() < self.notice_until:
             feedback.append(self.ui_notice)
         self.draw_text(screen, height - 2, 0, " | ".join(feedback) if feedback else "─" * (width - 1))
-        footer = "Ctrl+G Отправить | Ctrl+W Просмотр | F1 Справка | F6 Мысли | Ctrl+Q Выход"
+        footer = "Ctrl+G/Alt+Enter Отправить | Ctrl+W Просмотр | F1 Справка | F6 Мысли | Ctrl+Q Выход"
         if self.focus == "transcript":
             selected = abs(self.transcript.cursor - self.transcript.anchor) if self.transcript.anchor is not None else 0
             footer = "ПРОСМОТР | v Метка | y Буфер | f Файл | {} симв. | F6 Мысли | Enter Ввод".format(selected)
@@ -2395,6 +2483,10 @@ class App:
 
     def process_key(self, key, screen):
         """Handle editor keys and terminal escape protocols in the UI thread."""
+        if self.escape_buffer == "\x1b" and key == curses.KEY_ENTER and not self.paste:
+            self.escape_buffer = ""
+            self.process_key("\x07", screen)
+            return
         if self.escape_buffer:
             if isinstance(key, str):
                 self.escape_buffer += key
@@ -2541,7 +2633,7 @@ class App:
         if hasattr(curses, "set_escdelay"):
             escape_delay = positive_int(os.environ.get("ESCDELAY", "100")) or 100
             curses.set_escdelay(escape_delay)
-        sys.stdout.write("\x1b[?2004h")
+        sys.stdout.write("\x1b[?2004h\x1b[>1u")
         sys.stdout.flush()
         try:
             self.start_job("probe")
@@ -2574,7 +2666,7 @@ class App:
             self.persist()
             for worker in self.retired_workers:
                 worker.join(timeout=0.2)
-            sys.stdout.write("\x1b[?2004l")
+            sys.stdout.write("\x1b[<u\x1b[?2004l")
             sys.stdout.flush()
 
 
@@ -2669,6 +2761,75 @@ class SelfTests(unittest.TestCase):
             recovered = store.load()
         self.assertFalse(recovered.messages)
         self.assertTrue(list(self.root.glob("corrupt-*.json")))
+
+    def test_token_totals_missing_data_and_session_lifecycle(self):
+        session = Session(messages=[
+            Message("user", "request", metadata={"usage": {"prompt_tokens": 999}}),
+            Message("assistant", "old attempt", metadata={
+                "superseded": True, "usage": {"prompt_tokens": 100, "completion_tokens": 20}}),
+            Message("assistant", "retry", metadata={"usage": {"prompt_tokens": 150, "completion_tokens": 30}}),
+            Message("assistant", "partial", metadata={"stopped_by_user": True}),
+            Message("assistant", "failed", metadata={"error": "broken", "usage": {"completion_tokens": 5}}),
+        ])
+        store = SessionStore(self.root)
+        app = App(store, session, self.root / "test.log")
+        self.assertEqual(app.token_totals(), ([250, 55], [2, 1]))
+        self.assertIn("IN:250+? OUT:55+?", app.status_line())
+        app.cmd_tokens([])
+        self.assertIn("Последний запрос: IN ? | OUT 5", session.messages[-1].content)
+        self.assertIn("Ответов без статистики: IN 2 | OUT 1", session.messages[-1].content)
+        app.persist()
+        restored = App(store, store.load(), self.root / "test.log")
+        self.assertEqual(restored.token_totals(), app.token_totals())
+        archive_id = store.archive(session)
+        app.cmd_new([])
+        self.assertEqual(app.token_totals(), ([0, 0], [0, 0]))
+        self.assertIn("IN:0 OUT:0", app.status_line())
+        with mock.patch.object(NetworkWorker, "start"):
+            app.cmd_open([archive_id])
+        self.assertEqual(app.token_totals(), ([250, 55], [2, 1]))
+        self.assertIn("IN:250+? OUT:55+?", app.status_line())
+
+    def test_token_usage_validation(self):
+        for invalid in (None, True, False, -1, 1.5, "10", [], {}):
+            message = Message("assistant", "answer", metadata={
+                "usage": {"prompt_tokens": invalid, "completion_tokens": invalid}})
+            self.assertEqual(reported_token_usage(message), (None, None))
+        for usage in (None, [], "invalid"):
+            message = Message("assistant", "answer", metadata={"usage": usage})
+            self.assertEqual(reported_token_usage(message), (None, None))
+        message = Message("assistant", "", metadata={"usage": {"prompt_tokens": 0, "completion_tokens": 0}})
+        self.assertEqual(reported_token_usage(message), (0, 0))
+        self.assertEqual(format_token_total(0, 1), "?")
+
+    def test_streamed_usage_updates_do_not_double_count(self):
+        app = App(SessionStore(self.root), Session(model="test"), self.root / "test.log")
+        app.job_id = 5
+        app.job_kind = "generate"
+        prepared = ContextManager(mock.Mock(count_tokens=estimate_tokens), 32768, 20).build(app.session, "request")
+        app.events.put({"job": 5, "type": "PREPARED", "context": prepared, "request": "request", "model": "test"})
+        self.drain_all(app)
+        self.assertIn("IN:? OUT:?", app.status_line())
+        for event in ({"type": "USAGE", "usage": {"prompt_tokens": 100, "completion_tokens": 0}},
+                      {"type": "TOKEN", "text": "answer"},
+                      {"type": "REASONING", "text": "thoughts"},
+                      {"type": "USAGE", "usage": {"completion_tokens": 10}},
+                      {"type": "USAGE", "usage": {"completion_tokens": 10}},
+                      {"type": "TIMINGS", "timings": {"prompt_n": 1, "predicted_n": 10}}):
+            event["job"] = 5
+            app.events.put(event)
+        app.events.put({"job": 4, "type": "USAGE", "usage": {"prompt_tokens": 999}})
+        self.drain_all(app)
+        self.assertEqual(app.token_totals(), ([100, 10], [0, 0]))
+        self.assertIn("IN:100 OUT:10", app.status_line())
+        app.events.put({"job": 5, "type": "END", "stopped": True})
+        self.drain_all(app)
+        restored = App(app.store, app.store.load(), self.root / "test.log")
+        self.assertEqual(restored.token_totals(), ([100, 10], [0, 0]))
+        self.assertIn("IN:100 OUT:10", restored.status_line())
+        with mock.patch.object(NetworkWorker, "start"):
+            restored.start_job("context")
+        self.assertEqual(restored.token_totals(), ([100, 10], [0, 0]))
 
     def test_export_and_code_fences(self):
         store = SessionStore(self.root)
@@ -2881,6 +3042,186 @@ class SelfTests(unittest.TestCase):
         view.follow = True
         view.visible(10)
         self.assertEqual(view.offset, len(view.rows) - 10)
+
+    def test_single_system_prompt_and_legacy_session(self):
+        session = Session(system_prompt="ansible", messages=[Message("user", "keep history")])
+        prepared = ContextManager(mock.Mock(count_tokens=estimate_tokens), 32768, 20).build(
+            session, "Проверь также безопасность")
+        self.assertEqual(prepared["messages"][0], {"role": "system", "content": SYSTEM_PROMPTS["ansible"]})
+        self.assertEqual(prepared["messages"][-1]["content"], "Проверь также безопасность")
+        app = App(SessionStore(self.root), session, self.root / "test.log")
+        self.assertIn("role:ansible", app.status_line())
+        data = session.to_dict()
+        data["system_prompt"] = "ansible+security"
+        with self.assertLogs(APP_NAME, level="WARNING"):
+            restored = Session.from_dict(data)
+        self.assertEqual(restored.system_prompt, "ansible")
+        self.assertEqual(restored.messages[0].content, "keep history")
+        for invalid in ("", "unknown", "ansible+unknown", "ansible+", "+ansible"):
+            with self.subTest(selection=invalid), self.assertRaises(AppError):
+                Session.from_dict({"system_prompt": invalid})
+
+    def test_system_prompt_selection_persistence_and_completion(self):
+        store = SessionStore(self.root)
+        app = App(store, Session(messages=[Message("user", "keep history")]), self.root / "test.log")
+        app.context = {"old": True}
+        app.editor.set_text("/sys ansible")
+        app.submit()
+        self.assertEqual(app.session.system_prompt, "ansible")
+        self.assertIsNone(app.context)
+        self.assertEqual(app.session.messages[0].content, "keep history")
+        self.assertEqual(store.load().system_prompt, "ansible")
+        archive_id = store.archive(app.session)
+        app.cmd_new([])
+        self.assertEqual(app.session.system_prompt, "ansible")
+        app.cmd_system(["python"])
+        self.assertEqual(app.session.system_prompt, "python")
+        with mock.patch.object(NetworkWorker, "start"):
+            app.cmd_open([archive_id])
+        self.assertEqual(app.session.system_prompt, "ansible")
+        for text, expected in (("/sys ans", "/system ansible"),
+                               ("/sys sh", "/system show"),
+                               ("/sys show sec", "/system show security")):
+            with self.subTest(text=text):
+                app.editor.set_text(text)
+                app.complete()
+                self.assertEqual(app.editor.text, expected)
+        self.assertEqual(Session.from_dict({"system_prompt": "python"}).system_prompt, "python")
+        self.assertEqual(Session.from_dict({}).system_prompt, "general")
+
+    def test_system_prompt_preview_does_not_change_generation(self):
+        app = App(SessionStore(self.root), Session(system_prompt="ansible"), self.root / "test.log")
+        worker = mock.Mock()
+        app.worker = worker
+        context = {"keep": True}
+        app.context = context
+        for args, selection in ((["show"], "ansible"), (["show", "python"], "python")):
+            app.cmd_system(args)
+            preview = app.session.messages[-1]
+            self.assertEqual(preview.role, "notification")
+            self.assertEqual(preview.content, "SYSTEM PROMPT: {}\n\n{}".format(selection, SYSTEM_PROMPTS[selection]))
+            self.assertEqual(app.session.system_prompt, "ansible")
+            self.assertIs(app.context, context)
+            self.assertIs(app.worker, worker)
+            worker.cancel.assert_not_called()
+        prepared = ContextManager(mock.Mock(count_tokens=estimate_tokens), 32768, 20).build(app.session, "request")
+        self.assertEqual(len(prepared["messages"]), 2)
+        self.assertEqual(prepared["messages"][0]["content"], SYSTEM_PROMPTS["ansible"])
+
+    def test_invalid_system_roles_preserve_selection_and_input(self):
+        app = App(SessionStore(self.root), Session(system_prompt="python"), self.root / "test.log")
+        worker = mock.Mock()
+        app.worker = worker
+        for text in ("/system ansible security", "/system show ansible security", "/system show unknown", "/system ansible+security"):
+            app.editor.set_text(text)
+            app.submit()
+            self.assertEqual(app.editor.text, text)
+            self.assertEqual(app.session.system_prompt, "python")
+            worker.cancel.assert_not_called()
+            self.assertEqual(app.session.messages[-1].role, "error")
+
+    def test_commands_and_requests_share_persistent_history(self):
+        app = App(SessionStore(self.root), Session(model="test", input_history=["old request"]), self.root / "test.log")
+        screen = mock.Mock()
+        for command in ("/sys ansible", "/system show security", "/tokens"):
+            app.editor.set_text(command)
+            app.process_key("\x07", screen)
+        expected = ["old request", "/sys ansible", "/system show security", "/tokens"]
+        self.assertEqual(app.session.input_history, expected)
+        self.assertEqual(app.store.load().input_history, expected)
+        app.editor.set_text("unfinished draft")
+        for entry in reversed(expected):
+            app.process_key("\x10", screen)
+            self.assertEqual(app.editor.text, entry)
+        for entry in expected[1:] + ["unfinished draft"]:
+            app.process_key("\x0e", screen)
+            self.assertEqual(app.editor.text, entry)
+        app.process_key("\x10", screen)
+        app.process_key("\x07", screen)
+        self.assertEqual(app.session.input_history, expected + ["/tokens"])
+        self.assertIsNone(app.editor.history_position)
+        with mock.patch.object(NetworkWorker, "start"):
+            app.editor.set_text("new request")
+            app.process_key("\x07", screen)
+        prepared = ContextManager(mock.Mock(count_tokens=estimate_tokens), 32768, 20).build(app.session, "new request")
+        app.events.put({"job": app.job_id, "type": "PREPARED", "context": prepared,
+                        "request": "new request", "model": "test"})
+        app.events.put({"job": app.job_id, "type": "END", "stopped": False})
+        self.drain_all(app)
+        self.assertEqual(app.store.load().input_history, expected + ["/tokens", "new request"])
+        self.assertFalse(any(item["content"].startswith("/") for item in prepared["messages"]))
+
+    def test_session_commands_remain_in_active_history(self):
+        app = App(SessionStore(self.root), Session(), self.root / "test.log")
+        app.editor.set_text("/new example")
+        app.submit()
+        self.assertEqual(app.store.load().input_history, ["/new example"])
+        identifier = app.store.archive(app.session)
+        command = "/open " + identifier
+        with mock.patch.object(NetworkWorker, "start"):
+            app.editor.set_text(command)
+            app.submit()
+        self.assertEqual(app.store.load().input_history, ["/new example", command])
+        app.editor.set_text("/quit")
+        app.submit()
+        self.assertEqual(app.store.load().input_history, ["/new example", command, "/quit"])
+
+    def test_alt_enter_commands_requests_and_plain_enter(self):
+        screen = mock.Mock()
+        packets = ("\x07", "\x1b\r", "\x1b\n", "\x1b[13;3u", "\x1b[13;67u", "\x1b[13;3:1u",
+                   "\x1b[27;3;13~", "\x1b[13;3~", "\x1b[57414;3u", ("\x1b", curses.KEY_ENTER))
+        for packet in packets:
+            app = App(SessionStore(self.root), Session(), self.root / "test.log")
+            app.editor.set_text("/system ansible")
+            for key in packet:
+                app.process_key(key, screen)
+            self.assertEqual(app.session.system_prompt, "ansible")
+            self.assertEqual(app.session.input_history, ["/system ansible"])
+            self.assertEqual(app.editor.text, "")
+            app.editor.set_text("review")
+            with mock.patch.object(app, "start_job") as start_job:
+                for key in packet:
+                    app.process_key(key, screen)
+                start_job.assert_called_once_with("generate", "review")
+        for packet in ("\n", "\r", curses.KEY_ENTER, "\x1b[13u", "\x1b[13;65u", "\x1b[57414u",
+                       "\x1b[13;5u", "\x1b[27;5;13~"):
+            app = App(SessionStore(self.root), Session(draft="/help"), self.root / "test.log")
+            with mock.patch.object(app, "submit") as submit:
+                keys = [packet] if isinstance(packet, int) else packet
+                for key in keys:
+                    app.process_key(key, screen)
+                submit.assert_not_called()
+            self.assertEqual(app.editor.text, "/help\n")
+        app = App(SessionStore(self.root), Session(), self.root / "test.log")
+        with mock.patch.object(app, "submit") as submit:
+            for key in "\x1b[13;3:3u":
+                app.process_key(key, screen)
+            submit.assert_not_called()
+            for key in "\x1b[200~/help\n\x1b\r\x1b[13;3u\x1b[201~":
+                app.process_key(key, screen)
+            submit.assert_not_called()
+        self.assertIn("/help\n", app.editor.text)
+        self.assertEqual(decode_modified_key("\x1b[27u"), "\x1b")
+        self.assertEqual(decode_modified_key("\x1b[57419u"), curses.KEY_UP)
+        self.assertEqual(decode_modified_key("\x1b[57417;2u"), curses.KEY_SLEFT)
+
+    def test_keyboard_protocol_restored_on_exit_and_startup_error(self):
+        for failing in (False, True):
+            app = App(SessionStore(self.root), Session(), self.root / "test.log")
+            screen = mock.Mock()
+            screen.get_wch.return_value = "\x11"
+            with mock.patch(__name__ + ".curses.raw"), mock.patch(__name__ + ".curses.curs_set"), \
+                    mock.patch(__name__ + ".curses.set_escdelay", create=True), \
+                    mock.patch.object(app, "draw"), mock.patch.object(app, "start_job") as start_job, \
+                    mock.patch(__name__ + ".sys.stdout") as output:
+                if failing:
+                    start_job.side_effect = AppError("connection failed")
+                    with self.assertRaises(AppError):
+                        app.run(screen)
+                else:
+                    app.run(screen)
+                self.assertEqual(output.write.call_args_list, [mock.call("\x1b[?2004h\x1b[>1u"),
+                                                               mock.call("\x1b[<u\x1b[?2004l")])
 
     def test_app_ambiguity_completion_and_notifications(self):
         app = App(SessionStore(self.root), Session(), self.root / "test.log")
@@ -3219,7 +3560,7 @@ class SelfTests(unittest.TestCase):
                                      ("D", curses.KEY_SLEFT), ("H", curses.KEY_SHOME), ("F", curses.KEY_SEND)):
                 self.assertEqual(decode_modified_key("\x1b[1;66" + ending), expected)
             with mock.patch.object(app, "submit") as submit:
-                for packet in ("\x1b[13;5u", "\x1b[13;69u", "\x1b[13;69:1u", "\x1b[27;69;13~"):
+                for packet in ("\x1b[13;3u", "\x1b[13;67u", "\x1b[13;67:1u", "\x1b[27;67;13~"):
                     for key in packet:
                         app.process_key(key, screen)
                 self.assertEqual(submit.call_count, 4)

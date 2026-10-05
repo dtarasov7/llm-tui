@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.1.0] - 2026-10-05
+
+### Added
+
+- Cumulative input/output token usage (`IN`/`OUT`) in the status line and `/tokens`
+  details for the last request and current session. Counts restore with the
+  conversation and include previous retry attempts; missing server statistics
+  are marked with `?` or `+?`.
+- `/system show [ROLE]` to inspect the active or specified prompt without changing
+  the role or interrupting generation, with Tab completion for the role.
+
+### Changed
+
+- Successfully executed commands typed in the editor are saved alongside requests
+  in persistent Ctrl+P/Ctrl+N history.
+- Alt+Enter replaces Ctrl+Enter for sending requests and executing commands.
+  Ctrl+G remains available; Enter inserts a newline. Legacy Escape-prefixed Enter,
+  CSI-u and modifyOtherKeys encodings are supported. PuTTY users must disable
+  `Window → Behaviour → Full screen on Alt-Enter` if enabled.
+- One system role is selected at a time; additional requirements belong in the task
+  text. Older sessions with combined roles restore the first role and retain the
+  conversation, with a warning in the log.
+- Keyboard disambiguation is enabled in terminals supporting kitty/CSI-u, with the
+  previous mode restored on exit.
+
+### Fixed
+
+- Repeated usage updates replace an attempt's token counts without double counting;
+  partial updates retain previously received usage fields.
+
 ## [1.0.0] - 2026-10-04
 
 First release of llm-tui, a terminal client for engineering conversations with local LLMs.
@@ -25,4 +55,3 @@ First release of llm-tui, a terminal client for engineering conversations with l
 - Function keys preserve panel focus; new requests remain visible after command output.
 - llama.cpp router context discovery and token counting use the selected model. Metadata requests allow time for model loading.
 - Command results and notifications scroll to their final line. Manual scrolling remains stable across redraws and streamed response updates.
-
